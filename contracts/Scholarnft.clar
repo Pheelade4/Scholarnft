@@ -15,6 +15,9 @@
 (define-constant err-milestone-already-claimed (err u109))
 (define-constant err-invalid-milestone (err u110))
 (define-constant err-scholarship-complete (err u111))
+(define-constant err-badge-already-earned (err u112))
+(define-constant err-insufficient-reputation (err u113))
+(define-constant err-invalid-badge-type (err u114))
 
 (define-data-var last-token-id uint u0)
 (define-data-var mint-limit uint u10000)
@@ -55,6 +58,29 @@
     organization: (string-ascii 128),
     total-sponsored: uint,
     active-scholarships: uint
+})
+
+(define-map achievement-badges {student: principal, badge-type: (string-ascii 32)} {
+    earned-at: uint,
+    points: uint,
+    description: (string-ascii 128),
+    verified: bool
+})
+
+(define-map student-reputation principal {
+    total-points: uint,
+    badges-earned: uint,
+    scholarships-completed: uint,
+    average-completion-time: uint,
+    reputation-level: (string-ascii 16)
+})
+
+(define-map badge-requirements (string-ascii 32) {
+    min-scholarships: uint,
+    min-gpa: uint,
+    min-completion-rate: uint,
+    points-awarded: uint,
+    description: (string-ascii 128)
 })
 
 (define-public (get-last-token-id)
@@ -283,5 +309,221 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (ok (var-set mint-price price))
+    )
+)
+
+(define-public (setup-badge-requirements)
+    (begin
+        (map-set badge-requirements "excellence" {
+            min-scholarships: u1,
+            min-gpa: u90,
+            min-completion-rate: u95,
+            points-awarded: u100,
+            description: "Awarded for exceptional academic performance"
+        })
+        (map-set badge-requirements "completion" {
+            min-scholarships: u3,
+            min-gpa: u70,
+            min-completion-rate: u85,
+            points-awarded: u75,
+            description: "Awarded for consistent scholarship completion"
+        })
+        (map-set badge-requirements "milestone" {
+            min-scholarships: u1,
+            min-gpa: u60,
+            min-completion-rate: u80,
+            points-awarded: u50,
+            description: "Awarded for reaching scholarship milestones"
+        })
+        (map-set badge-requirements "community" {
+            min-scholarships: u5,
+            min-gpa: u75,
+            min-completion-rate: u90,
+            points-awarded: u125,
+            description: "Awarded for outstanding community contribution"
+        })
+        (ok true)
+    )
+)
+
+(define-public (earn-badge (student principal) (badge-type (string-ascii 32)))
+    (let
+        (
+            (requirements (unwrap! (map-get? badge-requirements badge-type) err-invalid-badge-type))
+            (student-profile (unwrap! (map-get? student-profiles student) err-not-found))
+            (reputation (default-to {
+                total-points: u0,
+                badges-earned: u0,
+                scholarships-completed: u0,
+                average-completion-time: u0,
+                reputation-level: "novice"
+            } (map-get? student-reputation student)))
+        )
+        (asserts! (is-none (map-get? achievement-badges {student: student, badge-type: badge-type})) err-badge-already-earned)
+        (asserts! (>= (get gpa student-profile) (get min-gpa requirements)) err-insufficient-reputation)
+        (asserts! (>= (get scholarships-completed reputation) (get min-scholarships requirements)) err-insufficient-reputation)
+        (map-set achievement-badges {student: student, badge-type: badge-type} {
+            earned-at: stacks-block-height,
+            points: (get points-awarded requirements),
+            description: (get description requirements),
+            verified: true
+        })
+        (map-set student-reputation student (merge reputation {
+            total-points: (+ (get total-points reputation) (get points-awarded requirements)),
+            badges-earned: (+ (get badges-earned reputation) u1)
+        }))
+        (ok true)
+    )
+)
+
+(define-public (update-reputation-after-scholarship (student principal))
+    (let
+        (
+            (reputation (default-to {
+                total-points: u0,
+                badges-earned: u0,
+                scholarships-completed: u0,
+                average-completion-time: u0,
+                reputation-level: "novice"
+            } (map-get? student-reputation student)))
+            (new-completion-count (+ (get scholarships-completed reputation) u1))
+            (new-level (calculate-reputation-level (+ (get total-points reputation) u25)))
+        )
+        (map-set student-reputation student (merge reputation {
+            scholarships-completed: new-completion-count,
+            total-points: (+ (get total-points reputation) u25),
+            reputation-level: new-level
+        }))
+        (ok true)
+    )
+)
+
+(define-private (calculate-reputation-level (points uint))
+    (if (>= points u500)
+        "master"
+        (if (>= points u250)
+            "expert"
+            (if (>= points u100)
+                "advanced"
+                (if (>= points u50)
+                    "intermediate"
+                    "novice"
+                )
+            )
+        )
+    )
+)
+
+(define-public (award-milestone-badge (scholarship-id uint) (milestone-id uint))
+    (let
+        (
+            (scholarship (unwrap! (map-get? scholarships scholarship-id) err-not-found))
+            (milestone (unwrap! (map-get? milestones {scholarship-id: scholarship-id, milestone-id: milestone-id}) err-not-found))
+            (student (get student scholarship))
+        )
+        (asserts! (get completed milestone) err-milestone-not-ready)
+        (asserts! (is-eq tx-sender (get sponsor scholarship)) err-not-token-owner)
+        (unwrap! (earn-badge student "milestone") err-badge-already-earned)
+        (ok true)
+    )
+)
+
+(define-public (check-and-award-completion-badge (scholarship-id uint))
+    (let
+        (
+            (scholarship (unwrap! (map-get? scholarships scholarship-id) err-not-found))
+            (student (get student scholarship))
+        )
+        (asserts! (not (get active scholarship)) err-scholarship-complete)
+        (asserts! (is-eq (get milestones-completed scholarship) (get total-milestones scholarship)) err-milestone-not-ready)
+        (unwrap! (update-reputation-after-scholarship student) err-not-found)
+        (unwrap! (earn-badge student "completion") err-badge-already-earned)
+        (ok true)
+    )
+)
+
+(define-public (nominate-for-excellence-badge (student principal))
+    (let
+        (
+            (student-profile (unwrap! (map-get? student-profiles student) err-not-found))
+            (reputation (unwrap! (map-get? student-reputation student) err-not-found))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get verified student-profile) err-insufficient-reputation)
+        (asserts! (>= (get gpa student-profile) u90) err-insufficient-reputation)
+        (asserts! (>= (get scholarships-completed reputation) u1) err-insufficient-reputation)
+        (unwrap! (earn-badge student "excellence") err-badge-already-earned)
+        (ok true)
+    )
+)
+
+(define-public (nominate-for-community-badge (student principal))
+    (let
+        (
+            (student-profile (unwrap! (map-get? student-profiles student) err-not-found))
+            (reputation (unwrap! (map-get? student-reputation student) err-not-found))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get verified student-profile) err-insufficient-reputation)
+        (asserts! (>= (get scholarships-completed reputation) u5) err-insufficient-reputation)
+        (unwrap! (earn-badge student "community") err-badge-already-earned)
+        (ok true)
+    )
+)
+
+(define-read-only (get-student-badges (student principal))
+    (let
+        (
+            (badge-types (list "excellence" "completion" "milestone" "community"))
+        )
+        (map get-badge-info badge-types)
+    )
+)
+
+(define-private (get-badge-info (badge-type (string-ascii 32)))
+    (map-get? achievement-badges {student: tx-sender, badge-type: badge-type})
+)
+
+(define-read-only (get-student-reputation-info (student principal))
+    (map-get? student-reputation student)
+)
+
+(define-read-only (get-badge-requirements-info (badge-type (string-ascii 32)))
+    (map-get? badge-requirements badge-type)
+)
+
+(define-read-only (calculate-student-rank (student principal))
+    (match (map-get? student-reputation student)
+        reputation (ok {
+            rank: (get reputation-level reputation),
+            points: (get total-points reputation),
+            badges: (get badges-earned reputation),
+            completed-scholarships: (get scholarships-completed reputation)
+        })
+        err-not-found
+    )
+)
+
+(define-read-only (get-top-students)
+    (let
+        (
+            (student-list (list tx-sender))
+        )
+        (map get-student-rank-info student-list)
+    )
+)
+
+(define-private (get-student-rank-info (student principal))
+    (match (map-get? student-reputation student)
+        reputation {
+            student: student,
+            points: (get total-points reputation),
+            level: (get reputation-level reputation)
+        }
+        {
+            student: student,
+            points: u0,
+            level: "novice"
+        }
     )
 )
