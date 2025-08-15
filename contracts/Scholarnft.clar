@@ -18,10 +18,19 @@
 (define-constant err-badge-already-earned (err u112))
 (define-constant err-insufficient-reputation (err u113))
 (define-constant err-invalid-badge-type (err u114))
+(define-constant err-not-arbitrator (err u115))
+(define-constant err-dispute-not-found (err u116))
+(define-constant err-dispute-already-resolved (err u117))
+(define-constant err-already-voted (err u118))
+(define-constant err-escrow-not-found (err u119))
+(define-constant err-insufficient-arbitrators (err u120))
+(define-constant err-invalid-dispute-reason (err u121))
 
 (define-data-var last-token-id uint u0)
 (define-data-var mint-limit uint u10000)
 (define-data-var mint-price uint u1000000)
+(define-data-var dispute-counter uint u0)
+(define-data-var arbitrator-fee uint u10000)
 
 (define-map token-count principal uint)
 (define-map market {token-id: uint} {price: uint, commission: principal})
@@ -81,6 +90,53 @@
     min-completion-rate: uint,
     points-awarded: uint,
     description: (string-ascii 128)
+})
+
+;; Escrow and Dispute Resolution Maps
+(define-map arbitrators principal {
+    verified: bool,
+    cases-resolved: uint,
+    reputation-score: uint,
+    fee: uint,
+    joined-at: uint
+})
+
+(define-map scholarship-escrow uint {
+    scholarship-id: uint,
+    total-amount: uint,
+    released-amount: uint,
+    arbitrator-1: principal,
+    arbitrator-2: principal,
+    arbitrator-3: principal,
+    escrow-status: (string-ascii 16),
+    created-at: uint
+})
+
+(define-map disputes uint {
+    dispute-id: uint,
+    scholarship-id: uint,
+    plaintiff: principal,
+    defendant: principal,
+    reason: (string-ascii 256),
+    amount-disputed: uint,
+    created-at: uint,
+    status: (string-ascii 16),
+    resolution: (optional (string-ascii 256))
+})
+
+(define-map dispute-votes {dispute-id: uint, arbitrator: principal} {
+    vote: (string-ascii 16),
+    reason: (string-ascii 128),
+    voted-at: uint
+})
+
+(define-map dispute-results uint {
+    dispute-id: uint,
+    winner: principal,
+    amount-awarded: uint,
+    votes-for-plaintiff: uint,
+    votes-for-defendant: uint,
+    resolved-at: uint
 })
 
 (define-public (get-last-token-id)
@@ -527,3 +583,312 @@
         }
     )
 )
+
+;; Arbitrator Management Functions
+(define-public (register-arbitrator (fee uint))
+    (begin
+        (map-set arbitrators tx-sender {
+            verified: false,
+            cases-resolved: u0,
+            reputation-score: u0,
+            fee: fee,
+            joined-at: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (verify-arbitrator (arbitrator principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (match (map-get? arbitrators arbitrator)
+            arbitrator-data (begin
+                (map-set arbitrators arbitrator (merge arbitrator-data {verified: true}))
+                (ok true)
+            )
+            err-not-found
+        )
+    )
+)
+
+;; Enhanced Scholarship Creation with Escrow
+(define-public (create-scholarship-with-escrow (student principal) (total-amount uint) (total-milestones uint) (arbitrator-1 principal) (arbitrator-2 principal) (arbitrator-3 principal))
+    (let
+        (
+            (token-id (+ (var-get last-token-id) u1))
+            (arb1-data (unwrap! (map-get? arbitrators arbitrator-1) err-not-arbitrator))
+            (arb2-data (unwrap! (map-get? arbitrators arbitrator-2) err-not-arbitrator))
+            (arb3-data (unwrap! (map-get? arbitrators arbitrator-3) err-not-arbitrator))
+        )
+        ;; Validate arbitrators are verified
+        (asserts! (get verified arb1-data) err-not-arbitrator)
+        (asserts! (get verified arb2-data) err-not-arbitrator)
+        (asserts! (get verified arb3-data) err-not-arbitrator)
+        (asserts! (> total-amount u0) err-insufficient-funds)
+        (asserts! (> total-milestones u0) err-invalid-milestone)
+        
+        ;; Transfer funds to contract for escrow
+        (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+        (try! (nft-mint? scholar-nft token-id student))
+        
+        ;; Create scholarship record
+        (map-set scholarships token-id {
+            student: student,
+            sponsor: tx-sender,
+            total-amount: total-amount,
+            claimed-amount: u0,
+            milestones-completed: u0,
+            total-milestones: total-milestones,
+            active: true,
+            created-at: stacks-block-height
+        })
+        
+        ;; Create escrow record
+        (map-set scholarship-escrow token-id {
+            scholarship-id: token-id,
+            total-amount: total-amount,
+            released-amount: u0,
+            arbitrator-1: arbitrator-1,
+            arbitrator-2: arbitrator-2,
+            arbitrator-3: arbitrator-3,
+            escrow-status: "active",
+            created-at: stacks-block-height
+        })
+        
+        ;; Update sponsor profile
+        (match (map-get? sponsor-profiles tx-sender)
+            sponsor-data (map-set sponsor-profiles tx-sender (merge sponsor-data {
+                total-sponsored: (+ (get total-sponsored sponsor-data) total-amount),
+                active-scholarships: (+ (get active-scholarships sponsor-data) u1)
+            }))
+            (map-set sponsor-profiles tx-sender {
+                name: "",
+                organization: "",
+                total-sponsored: total-amount,
+                active-scholarships: u1
+            })
+        )
+        (var-set last-token-id token-id)
+        (ok token-id)
+    )
+)
+
+;; Dispute Filing System
+(define-public (file-dispute (scholarship-id uint) (reason (string-ascii 256)) (amount-disputed uint))
+    (let
+        (
+            (scholarship (unwrap! (map-get? scholarships scholarship-id) err-not-found))
+            (escrow (unwrap! (map-get? scholarship-escrow scholarship-id) err-escrow-not-found))
+            (dispute-id (+ (var-get dispute-counter) u1))
+        )
+        ;; Only student or sponsor can file dispute
+        (asserts! (or (is-eq tx-sender (get student scholarship)) (is-eq tx-sender (get sponsor scholarship))) err-not-token-owner)
+        (asserts! (is-eq (get escrow-status escrow) "active") err-scholarship-complete)
+        (asserts! (> amount-disputed u0) err-insufficient-funds)
+        (asserts! (<= amount-disputed (get total-amount escrow)) err-insufficient-funds)
+        
+        ;; Determine defendant
+        (let
+            (
+                (defendant (if (is-eq tx-sender (get student scholarship)) (get sponsor scholarship) (get student scholarship)))
+            )
+            ;; Create dispute record
+            (map-set disputes dispute-id {
+                dispute-id: dispute-id,
+                scholarship-id: scholarship-id,
+                plaintiff: tx-sender,
+                defendant: defendant,
+                reason: reason,
+                amount-disputed: amount-disputed,
+                created-at: stacks-block-height,
+                status: "pending",
+                resolution: none
+            })
+            
+            ;; Update escrow status
+            (map-set scholarship-escrow scholarship-id (merge escrow {escrow-status: "disputed"}))
+            (var-set dispute-counter dispute-id)
+            (ok dispute-id)
+        )
+    )
+)
+
+;; Arbitrator Voting System
+(define-public (vote-on-dispute (dispute-id uint) (vote (string-ascii 16)) (reason (string-ascii 128)))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (scholarship-id (get scholarship-id dispute))
+            (escrow (unwrap! (map-get? scholarship-escrow scholarship-id) err-escrow-not-found))
+        )
+        ;; Verify arbitrator is assigned to this escrow
+        (asserts! (or 
+            (is-eq tx-sender (get arbitrator-1 escrow))
+            (is-eq tx-sender (get arbitrator-2 escrow))
+            (is-eq tx-sender (get arbitrator-3 escrow))
+        ) err-not-arbitrator)
+        
+        ;; Check dispute is still pending
+        (asserts! (is-eq (get status dispute) "pending") err-dispute-already-resolved)
+        
+        ;; Check arbitrator hasn't already voted
+        (asserts! (is-none (map-get? dispute-votes {dispute-id: dispute-id, arbitrator: tx-sender})) err-already-voted)
+        
+        ;; Valid vote options
+        (asserts! (or (is-eq vote "plaintiff") (is-eq vote "defendant")) err-invalid-dispute-reason)
+        
+        ;; Record vote
+        (map-set dispute-votes {dispute-id: dispute-id, arbitrator: tx-sender} {
+            vote: vote,
+            reason: reason,
+            voted-at: stacks-block-height
+        })
+        
+        ;; Check if we have majority (2 out of 3 votes)
+        (try! (check-and-resolve-dispute dispute-id))
+        (ok true)
+    )
+)
+
+;; Dispute Resolution Logic
+(define-private (check-and-resolve-dispute (dispute-id uint))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (scholarship-id (get scholarship-id dispute))
+            (escrow (unwrap! (map-get? scholarship-escrow scholarship-id) err-escrow-not-found))
+            (vote-1 (map-get? dispute-votes {dispute-id: dispute-id, arbitrator: (get arbitrator-1 escrow)}))
+            (vote-2 (map-get? dispute-votes {dispute-id: dispute-id, arbitrator: (get arbitrator-2 escrow)}))
+            (vote-3 (map-get? dispute-votes {dispute-id: dispute-id, arbitrator: (get arbitrator-3 escrow)}))
+        )
+        ;; Count votes for each side
+        (let
+            (
+                (plaintiff-votes (+ 
+                    (if (and (is-some vote-1) (is-eq (get vote (unwrap-panic vote-1)) "plaintiff")) u1 u0)
+                    (+ (if (and (is-some vote-2) (is-eq (get vote (unwrap-panic vote-2)) "plaintiff")) u1 u0)
+                       (if (and (is-some vote-3) (is-eq (get vote (unwrap-panic vote-3)) "plaintiff")) u1 u0))))
+                (defendant-votes (+ 
+                    (if (and (is-some vote-1) (is-eq (get vote (unwrap-panic vote-1)) "defendant")) u1 u0)
+                    (+ (if (and (is-some vote-2) (is-eq (get vote (unwrap-panic vote-2)) "defendant")) u1 u0)
+                       (if (and (is-some vote-3) (is-eq (get vote (unwrap-panic vote-3)) "defendant")) u1 u0))))
+            )
+            ;; Resolve if we have majority
+            (if (>= plaintiff-votes u2)
+                (begin
+                    ;; Plaintiff wins - award disputed amount to plaintiff
+                    (try! (as-contract (stx-transfer? (get amount-disputed dispute) tx-sender (get plaintiff dispute))))
+                    (finalize-dispute-resolution dispute-id "plaintiff" plaintiff-votes defendant-votes)
+                )
+                (if (>= defendant-votes u2)
+                    (begin
+                        ;; Defendant wins - keep disputed amount in escrow
+                        (finalize-dispute-resolution dispute-id "defendant" plaintiff-votes defendant-votes)
+                    )
+                    (ok false) ;; Not enough votes yet
+                )
+            )
+        )
+    )
+)
+
+;; Finalize Dispute Resolution
+(define-private (finalize-dispute-resolution (dispute-id uint) (winner (string-ascii 16)) (plaintiff-votes uint) (defendant-votes uint))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (scholarship-id (get scholarship-id dispute))
+            (escrow (unwrap! (map-get? scholarship-escrow scholarship-id) err-escrow-not-found))
+            (winner-principal (if (is-eq winner "plaintiff") (get plaintiff dispute) (get defendant dispute)))
+        )
+        ;; Update dispute status
+        (map-set disputes dispute-id (merge dispute {
+            status: "resolved",
+            resolution: (some (concat "Resolved in favor of " winner))
+        }))
+        
+        ;; Record dispute result
+        (map-set dispute-results dispute-id {
+            dispute-id: dispute-id,
+            winner: winner-principal,
+            amount-awarded: (if (is-eq winner "plaintiff") (get amount-disputed dispute) u0),
+            votes-for-plaintiff: plaintiff-votes,
+            votes-for-defendant: defendant-votes,
+            resolved-at: stacks-block-height
+        })
+        
+        ;; Update escrow status back to active
+        (map-set scholarship-escrow scholarship-id (merge escrow {escrow-status: "active"}))
+        
+        ;; Update arbitrator reputation scores
+        (try! (update-arbitrator-reputation (get arbitrator-1 escrow)))
+        (try! (update-arbitrator-reputation (get arbitrator-2 escrow)))
+        (try! (update-arbitrator-reputation (get arbitrator-3 escrow)))
+        (ok true)
+    )
+)
+
+;; Update Arbitrator Reputation
+(define-private (update-arbitrator-reputation (arbitrator principal))
+    (match (map-get? arbitrators arbitrator)
+        arbitrator-data (begin
+            (map-set arbitrators arbitrator (merge arbitrator-data {
+                cases-resolved: (+ (get cases-resolved arbitrator-data) u1),
+                reputation-score: (+ (get reputation-score arbitrator-data) u10)
+            }))
+            (ok true)
+        )
+        err-not-found
+    )
+)
+
+;; Emergency Release Function (for contract owner)
+(define-public (emergency-release-funds (scholarship-id uint) (amount uint) (recipient principal))
+    (let
+        (
+            (escrow (unwrap! (map-get? scholarship-escrow scholarship-id) err-escrow-not-found))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= amount (- (get total-amount escrow) (get released-amount escrow))) err-insufficient-funds)
+        
+        ;; Transfer funds
+        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        
+        ;; Update escrow
+        (map-set scholarship-escrow scholarship-id (merge escrow {
+            released-amount: (+ (get released-amount escrow) amount)
+        }))
+        (ok true)
+    )
+)
+
+;; Read-only Functions for Escrow and Disputes
+(define-read-only (get-arbitrator-info (arbitrator principal))
+    (map-get? arbitrators arbitrator)
+)
+
+(define-read-only (get-escrow-info (scholarship-id uint))
+    (map-get? scholarship-escrow scholarship-id)
+)
+
+(define-read-only (get-dispute-info (dispute-id uint))
+    (map-get? disputes dispute-id)
+)
+
+(define-read-only (get-dispute-votes-info (dispute-id uint) (arbitrator principal))
+    (map-get? dispute-votes {dispute-id: dispute-id, arbitrator: arbitrator})
+)
+
+(define-read-only (get-dispute-result (dispute-id uint))
+    (map-get? dispute-results dispute-id)
+)
+
+
+(define-read-only (get-arbitrator-reputation (arbitrator principal))
+    (map-get? arbitrators arbitrator)
+)
+
+
+
+
+
